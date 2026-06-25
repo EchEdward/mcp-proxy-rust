@@ -42,17 +42,23 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             artifact_suffix: linux-amd64
             bin_ext: ""
+            rustflags: "-C target-feature=+crt-static"
+            macos_deployment_target: ""
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_suffix: windows-amd64
             bin_ext: .exe
+            rustflags: "-C target-feature=+crt-static"
+            macos_deployment_target: ""
           - os: macos-14
             target: aarch64-apple-darwin
             artifact_suffix: macos-arm64
             bin_ext: ""
+            rustflags: ""
+            macos_deployment_target: "11.0"
 
     steps:
       - name: Checkout
@@ -63,8 +69,34 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install musl toolchain (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
       - name: Build release binary
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Validate static Linux binary
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BIN_PATH="target/${{ matrix.target }}/release/${BINARY_NAME}${{ matrix.bin_ext }}"
+          file "$BIN_PATH"
+
+          if ldd "$BIN_PATH" 2>&1 | grep -q "not a dynamic executable"; then
+            echo "Linux binary is statically linked"
+          else
+            echo "Linux binary unexpectedly has dynamic dependencies"
+            ldd "$BIN_PATH" || true
+            exit 1
+          fi
 
       - name: Prepare binary artifact
         shell: bash
