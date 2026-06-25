@@ -1,0 +1,27 @@
+services:
+  filesystem-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.demo
+    ports:
+      - "9090:8080"
+    volumes:
+      # Expose the project's src/ directory as read-only workspace
+      - ./src:/workspace/src:ro
+    command:
+      - "--host=0.0.0.0"
+      - "--port=8080"
+      - "--"
+      - "mcp-server-filesystem"
+      - "/workspace/src"
+
+  filesystem-stdio-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - filesystem-proxy
+    stdin_open: true
+    tty: true
+    command:
+      - "http://filesystem-proxy:8080/mcp"

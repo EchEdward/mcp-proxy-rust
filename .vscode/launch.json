@@ -16,7 +16,7 @@
       "python": "${command:python.interpreterPath}",
       "envFile": "${workspaceFolder}/.env",
       "module": "mcp_proxy",
-      "args": ["--sse-port=8080", "--debug", "--", "uvx", "mcp-server-fetch"]
+      "args": ["--port=8080", "--debug", "--", "uvx", "mcp-server-fetch"]
     }
   ]
 }
