@@ -90,11 +90,13 @@ jobs:
           BIN_PATH="target/${{ matrix.target }}/release/${BINARY_NAME}${{ matrix.bin_ext }}"
           file "$BIN_PATH"
 
-          if ldd "$BIN_PATH" 2>&1 | grep -q "not a dynamic executable"; then
+          LDD_OUTPUT="$(ldd "$BIN_PATH" 2>&1 || true)"
+          echo "$LDD_OUTPUT"
+
+          if echo "$LDD_OUTPUT" | grep -Eq "not a dynamic executable|statically linked"; then
             echo "Linux binary is statically linked"
           else
             echo "Linux binary unexpectedly has dynamic dependencies"
-            ldd "$BIN_PATH" || true
             exit 1
           fi
 
