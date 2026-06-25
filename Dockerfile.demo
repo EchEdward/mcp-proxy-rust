@@ -1,3 +1,7 @@
+# Demo image: mcp-proxy (Rust) + Node.js runtime for the filesystem MCP server.
+# Used by docker-compose.yml to run the filesystem MCP server as a stdio child process
+# behind the mcp-proxy HTTP interface.
+
 # Stage 1: Build mcp-proxy
 FROM rust:alpine AS builder
 
@@ -12,11 +16,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked && \
     cp target/release/mcp-proxy /usr/local/bin/mcp-proxy
 
-# Stage 2: Minimal runtime image
-FROM alpine:3.21
-
-RUN apk add --no-cache ca-certificates
+# Stage 2: Node.js runtime with pre-installed filesystem MCP server
+FROM node:22-alpine
 
 COPY --from=builder /usr/local/bin/mcp-proxy /usr/local/bin/mcp-proxy
+
+RUN npm install -g @modelcontextprotocol/server-filesystem
 
 ENTRYPOINT ["mcp-proxy"]

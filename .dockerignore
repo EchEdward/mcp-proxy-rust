@@ -1,8 +1,8 @@
-# Exclude everything
+# Exclude everything by default
 *
 
-# Include required files only
-!/src/
-!pyproject.toml
-!uv.lock
+# Include only what's needed for the Rust build
+!Cargo.toml
+!Cargo.lock
+!src/
 !LICENSE
