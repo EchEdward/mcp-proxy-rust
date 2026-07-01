@@ -129,11 +129,13 @@ fn parse_server_entry(
         }
     }
 
+    let cwd = entry.get("cwd").and_then(serde_json::Value::as_str).map(PathBuf::from);
+
     Some(StdioServerConfig {
         command: command.to_owned(),
         args,
         env,
-        cwd: None,
+        cwd,
     })
 }
 
@@ -265,5 +267,21 @@ mod tests {
         );
         let result = load_named_server_configs_from_file(file.path(), &HashMap::new()).unwrap();
         assert!(result.contains_key("ok"));
+    }
+
+    #[test]
+    fn cwd_is_parsed_when_present() {
+        let file = write_temp_config(
+            r#"{"mcpServers": {"ok": {"command": "y", "cwd": "/tmp/workdir"}}}"#,
+        );
+        let result = load_named_server_configs_from_file(file.path(), &HashMap::new()).unwrap();
+        assert_eq!(result["ok"].cwd, Some(PathBuf::from("/tmp/workdir")));
+    }
+
+    #[test]
+    fn cwd_defaults_to_none_when_absent() {
+        let file = write_temp_config(r#"{"mcpServers": {"ok": {"command": "y"}}}"#);
+        let result = load_named_server_configs_from_file(file.path(), &HashMap::new()).unwrap();
+        assert_eq!(result["ok"].cwd, None);
     }
 }

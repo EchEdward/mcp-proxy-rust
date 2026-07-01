@@ -131,6 +131,22 @@ pub struct Cli {
     /// Headers to expose via Access-Control-Expose-Headers. Defaults to 'mcp-session-id'.
     #[arg(long = "expose-header", action = clap::ArgAction::Append)]
     pub expose_headers: Option<Vec<String>>,
+
+    /// Number of independent upstream HTTP connections to open in client mode.
+    /// Requests are round-robin distributed across the pool.
+    ///
+    /// The streamable-HTTP client transport in rmcp processes one outbound POST
+    /// at a time per connection (head-of-line blocking). A pool of N connections
+    /// allows up to N requests to be in flight concurrently; a slow or stuck
+    /// request on one connection only blocks 1/N of the traffic.
+    #[arg(long = "upstream-pool-size", default_value_t = 4)]
+    pub upstream_pool_size: usize,
+
+    /// Timeout in seconds for a single forwarded upstream request in client mode.
+    /// If the upstream server takes longer than this, the call returns an error
+    /// instead of blocking indefinitely.
+    #[arg(long = "upstream-timeout-secs", default_value_t = 30)]
+    pub upstream_timeout_secs: u64,
 }
 
 #[derive(Debug, thiserror::Error)]

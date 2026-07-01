@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::io::IsTerminal;
+use std::time::Duration;
 
 use axum::Router;
+use axum::serve::{Listener, ListenerExt};
 use clap::Parser;
 use rmcp::service::RunningService;
 use rmcp::transport::{
@@ -81,21 +83,34 @@ async fn run_client_mode(cli: Cli) -> Result<(), BoxError> {
 
     log_masked_headers(&headers);
     let verify_ssl = cli.verify_ssl();
-    let http_client = build_http_client(&headers, verify_ssl.as_ref())?;
+    let pool_size = cli.upstream_pool_size.max(1);
+    let timeout = Duration::from_secs(cli.upstream_timeout_secs);
 
-    let config = StreamableHttpClientTransportConfig::with_uri(url);
-    let transport = StreamableHttpClientTransport::with_client(http_client, config);
-
+    // Open `pool_size` independent upstream connections.  rmcp's streamable-HTTP
+    // client transport processes one outbound POST at a time per connection
+    // (head-of-line blocking inside its single-threaded worker loop).  With N
+    // connections the proxy can have up to N requests in flight concurrently;
+    // a slow/stuck request on one connection only blocks 1/N of the traffic.
+    tracing::info!(pool_size, "opening upstream connection pool");
     let relay = new_progress_relay_map();
-    let running = serve_client(RemoteNotificationRelay::new(relay.clone()), transport).await?;
-    let proxy = ForwardingProxy::new(running.peer().clone(), relay);
+    let mut runnings = Vec::with_capacity(pool_size);
+    for _ in 0..pool_size {
+        let http_client = build_http_client(&headers, verify_ssl.as_ref())?;
+        let config = StreamableHttpClientTransportConfig::with_uri(url);
+        let transport = StreamableHttpClientTransport::with_client(http_client, config);
+        let running = serve_client(RemoteNotificationRelay::new(relay.clone()), transport).await?;
+        runnings.push(running);
+    }
 
-    // Keep `running` alive for the duration of the stdio server so the
-    // upstream connection is not dropped.
+    let peers: Vec<_> = runnings.iter().map(|r| r.peer().clone()).collect();
+    let proxy = ForwardingProxy::new(peers, relay, timeout);
+
+    // Keep all `running` instances alive for the duration of the stdio server
+    // so the upstream connections are not dropped.
     let (stdin, stdout) = stdio();
     let server = serve_server(proxy, (stdin, stdout)).await?;
     server.waiting().await?;
-    drop(running);
+    drop(runnings);
     Ok(())
 }
 
@@ -120,7 +135,14 @@ async fn connect_to_stdio_server(config: &StdioServerConfig) -> Result<ProxyInst
     let child = TokioChildProcess::new(command)?;
     let relay = new_progress_relay_map();
     let running = serve_client(RemoteNotificationRelay::new(relay.clone()), child).await?;
-    let proxy = ForwardingProxy::new(running.peer().clone(), relay);
+    // Server mode: single upstream stdio connection is sufficient; the
+    // head-of-line blocking issue in rmcp's HTTP client doesn't apply here
+    // since the upstream is a child process (not a network HTTP worker).
+    let proxy = ForwardingProxy::new(
+        vec![running.peer().clone()],
+        relay,
+        Duration::from_secs(30),
+    );
     Ok(ProxyInstance { proxy, _client: running })
 }
 
@@ -199,7 +221,16 @@ async fn run_server_mode(cli: Cli) -> Result<(), BoxError> {
     }
 
     let addr = format!("{host}:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    // Streamable HTTP responses are written as multiple small chunks (an SSE
+    // priming event followed by the actual data event). Without TCP_NODELAY,
+    // Nagle's algorithm holds the second chunk back waiting for an ACK of the
+    // first, colliding with the peer's delayed-ACK timer for a ~40ms stall on
+    // every single request.
+    let listener = tokio::net::TcpListener::bind(&addr).await?.tap_io(|tcp_stream| {
+        if let Err(err) = tcp_stream.set_nodelay(true) {
+            tracing::trace!("failed to set TCP_NODELAY on incoming connection: {err:#}");
+        }
+    });
     let bound = listener.local_addr()?;
 
     // Log the MCP endpoints.

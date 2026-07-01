@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use rmcp::model::*;
 use rmcp::service::{NotificationContext, PeerRequestOptions, RequestContext};
@@ -52,28 +54,87 @@ impl ClientHandler for RemoteNotificationRelay {
     }
 }
 
-/// Exposes a connected remote MCP server as a local `ServerHandler`,
-/// forwarding every request and mirroring the remote's declared capabilities
-/// (captured once from its `InitializeResult` at connect time).
+/// Exposes a pool of connected remote MCP peers as a single local
+/// `ServerHandler`, forwarding every request via round-robin across the pool.
+///
+/// Why a pool? The underlying streamable-HTTP transport in rmcp processes one
+/// outbound POST at a time per `Peer` connection (single-threaded worker,
+/// head-of-line blocking). A pool of N independent connections allows up to N
+/// requests to be in flight concurrently; a slow or stuck request on one
+/// connection only blocks the 1/N of traffic routed through it.
+///
+/// All peers in the pool must already be initialized (their `peer_info()` set)
+/// and must talk to the same upstream server. Capabilities are read once from
+/// the first peer and assumed identical across the pool.
 #[derive(Clone)]
 pub struct ForwardingProxy {
-    remote: Peer<RoleClient>,
+    remotes: Arc<Vec<Peer<RoleClient>>>,
+    next: Arc<AtomicUsize>,
     remote_info: Arc<ServerInfo>,
     progress_relay: ProgressRelayMap,
+    timeout: Duration,
 }
 
 impl ForwardingProxy {
-    /// `remote` must already be initialized (its `peer_info()` must be set) -
-    /// true immediately after `serve_client(...).await?` returns.
-    pub fn new(remote: Peer<RoleClient>, progress_relay: ProgressRelayMap) -> Self {
-        let remote_info = remote
+    pub fn new(
+        remotes: Vec<Peer<RoleClient>>,
+        progress_relay: ProgressRelayMap,
+        timeout: Duration,
+    ) -> Self {
+        assert!(!remotes.is_empty(), "ForwardingProxy requires at least one peer");
+        let remote_info = remotes[0]
             .peer_info()
-            .expect("remote peer must complete its handshake before building a ForwardingProxy");
-        Self { remote, remote_info, progress_relay }
+            .expect("all remote peers must complete their handshake before building a ForwardingProxy");
+        Self {
+            remotes: Arc::new(remotes),
+            next: Arc::new(AtomicUsize::new(0)),
+            remote_info,
+            progress_relay,
+            timeout,
+        }
+    }
+
+    /// Pick the next peer in round-robin order (lock-free).
+    fn pick(&self) -> &Peer<RoleClient> {
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.remotes.len();
+        &self.remotes[idx]
     }
 
     fn capabilities(&self) -> &ServerCapabilities {
         &self.remote_info.capabilities
+    }
+
+    /// Await a fallible upstream future, converting ServiceError → McpError and
+    /// bounding the wait to `self.timeout`.
+    async fn forward<F, T>(&self, fut: F) -> Result<T, McpError>
+    where
+        F: std::future::Future<Output = Result<T, ServiceError>>,
+    {
+        match tokio::time::timeout(self.timeout, fut).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(to_mcp_error(error)),
+            Err(_elapsed) => Err(McpError::internal_error(
+                format!("upstream request timed out after {:?}", self.timeout),
+                None,
+            )),
+        }
+    }
+
+    /// Same as `forward`, but maps the outcome into `CallToolResult` so the
+    /// caller never sees a JSON-RPC protocol error for transport failures
+    /// (mirrors the Python proxy's approach).
+    async fn forward_tool_call<F>(&self, fut: F) -> CallToolResult
+    where
+        F: std::future::Future<Output = Result<CallToolResult, ServiceError>>,
+    {
+        match tokio::time::timeout(self.timeout, fut).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => CallToolResult::error(vec![Content::text(error.to_string())]),
+            Err(_elapsed) => CallToolResult::error(vec![Content::text(format!(
+                "upstream request timed out after {:?}",
+                self.timeout
+            ))]),
+        }
     }
 }
 
@@ -97,7 +158,7 @@ impl ServerHandler for ForwardingProxy {
         if self.capabilities().prompts.is_none() {
             return Err(McpError::method_not_found::<ListPromptsRequestMethod>());
         }
-        self.remote.list_prompts(request).await.map_err(to_mcp_error)
+        self.forward(self.pick().list_prompts(request)).await
     }
 
     async fn get_prompt(
@@ -108,7 +169,7 @@ impl ServerHandler for ForwardingProxy {
         if self.capabilities().prompts.is_none() {
             return Err(McpError::method_not_found::<GetPromptRequestMethod>());
         }
-        self.remote.get_prompt(request).await.map_err(to_mcp_error)
+        self.forward(self.pick().get_prompt(request)).await
     }
 
     async fn list_resources(
@@ -119,7 +180,7 @@ impl ServerHandler for ForwardingProxy {
         if self.capabilities().resources.is_none() {
             return Err(McpError::method_not_found::<ListResourcesRequestMethod>());
         }
-        self.remote.list_resources(request).await.map_err(to_mcp_error)
+        self.forward(self.pick().list_resources(request)).await
     }
 
     async fn list_resource_templates(
@@ -130,7 +191,7 @@ impl ServerHandler for ForwardingProxy {
         if self.capabilities().resources.is_none() {
             return Err(McpError::method_not_found::<ListResourceTemplatesRequestMethod>());
         }
-        self.remote.list_resource_templates(request).await.map_err(to_mcp_error)
+        self.forward(self.pick().list_resource_templates(request)).await
     }
 
     async fn read_resource(
@@ -141,7 +202,7 @@ impl ServerHandler for ForwardingProxy {
         if self.capabilities().resources.is_none() {
             return Err(McpError::method_not_found::<ReadResourceRequestMethod>());
         }
-        self.remote.read_resource(request).await.map_err(to_mcp_error)
+        self.forward(self.pick().read_resource(request)).await
     }
 
     async fn subscribe(
@@ -152,7 +213,7 @@ impl ServerHandler for ForwardingProxy {
         if self.capabilities().resources.is_none() {
             return Err(McpError::method_not_found::<SubscribeRequestMethod>());
         }
-        self.remote.subscribe(request).await.map_err(to_mcp_error)
+        self.forward(self.pick().subscribe(request)).await
     }
 
     async fn unsubscribe(
@@ -163,7 +224,7 @@ impl ServerHandler for ForwardingProxy {
         if self.capabilities().resources.is_none() {
             return Err(McpError::method_not_found::<UnsubscribeRequestMethod>());
         }
-        self.remote.unsubscribe(request).await.map_err(to_mcp_error)
+        self.forward(self.pick().unsubscribe(request)).await
     }
 
     #[allow(deprecated)]
@@ -175,7 +236,7 @@ impl ServerHandler for ForwardingProxy {
         if self.capabilities().logging.is_none() {
             return Err(McpError::method_not_found::<SetLevelRequestMethod>());
         }
-        self.remote.set_level(request).await.map_err(to_mcp_error)
+        self.forward(self.pick().set_level(request)).await
     }
 
     async fn list_tools(
@@ -186,13 +247,13 @@ impl ServerHandler for ForwardingProxy {
         if self.capabilities().tools.is_none() {
             return Err(McpError::method_not_found::<ListToolsRequestMethod>());
         }
-        self.remote.list_tools(request).await.map_err(to_mcp_error)
+        self.forward(self.pick().list_tools(request)).await
     }
 
-    /// Forwards a tool call to the remote server. Mirrors Python: any failure
-    /// (tool-level or transport-level) becomes `Ok(CallToolResult::error(...))`
-    /// rather than a JSON-RPC protocol error, except for the capability guard
-    /// above (an unroutable request).
+    /// Forwards a tool call to the remote server. Any failure (tool-level or
+    /// transport-level) becomes `Ok(CallToolResult::error(...))` rather than a
+    /// JSON-RPC protocol error, except for the capability guard above (an
+    /// unroutable request). A configurable timeout bounds the worst case.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -202,14 +263,16 @@ impl ServerHandler for ForwardingProxy {
             return Err(McpError::method_not_found::<CallToolRequestMethod>());
         }
 
+        // Bind a single peer for the whole call so progress relay tokens stay
+        // consistent (the `send_cancellable_request` + `await_response` pair
+        // must go to the same connection).
+        let remote = self.pick();
+
         // The service layer always extracts `_meta` (including any `progressToken`) into
         // `context.meta` during deserialization, so `request.progress_token()` is always
         // `None`. Read from context instead.
         let Some(caller_token) = context.meta.get_progress_token() else {
-            return Ok(match self.remote.call_tool(request).await {
-                Ok(result) => result,
-                Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
-            });
+            return Ok(self.forward_tool_call(remote.call_tool(request)).await);
         };
 
         // A progress token is present: bypass the convenience method so we can
@@ -218,13 +281,18 @@ impl ServerHandler for ForwardingProxy {
         // own token via `RemoteNotificationRelay::on_progress`.
         let caller_peer = context.peer.clone();
         let outbound = ClientRequest::CallToolRequest(CallToolRequest::new(request));
-        let handle = match self
-            .remote
-            .send_cancellable_request(outbound, PeerRequestOptions::no_options())
-            .await
+        let handle = match tokio::time::timeout(
+            self.timeout,
+            remote.send_cancellable_request(outbound, PeerRequestOptions::no_options()),
+        )
+        .await
         {
-            Ok(handle) => handle,
-            Err(error) => return Ok(CallToolResult::error(vec![Content::text(error.to_string())])),
+            Ok(Ok(handle)) => handle,
+            Ok(Err(error)) => return Ok(CallToolResult::error(vec![Content::text(error.to_string())])),
+            Err(_elapsed) => return Ok(CallToolResult::error(vec![Content::text(format!(
+                "upstream send timed out after {:?}",
+                self.timeout
+            ))])),
         };
         let remote_token = handle.progress_token.clone();
         self.progress_relay
@@ -232,7 +300,16 @@ impl ServerHandler for ForwardingProxy {
             .unwrap()
             .insert(remote_token.clone(), (caller_peer, caller_token));
 
-        let response = handle.await_response().await;
+        let response = match tokio::time::timeout(self.timeout, handle.await_response()).await {
+            Ok(resp) => resp,
+            Err(_elapsed) => {
+                self.progress_relay.lock().unwrap().remove(&remote_token);
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "upstream response timed out after {:?}",
+                    self.timeout
+                ))]));
+            }
+        };
         self.progress_relay.lock().unwrap().remove(&remote_token);
 
         Ok(match response {
@@ -251,14 +328,14 @@ impl ServerHandler for ForwardingProxy {
         request: CompleteRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CompleteResult, McpError> {
-        self.remote.complete(request).await.map_err(to_mcp_error)
+        self.forward(self.pick().complete(request)).await
     }
 
     /// Reverse direction: the downstream caller is reporting progress on some
     /// request we (or the remote) sent to it. Passed straight through with no
     /// token remapping, mirroring Python's unconditional `_send_progress_notification`.
     async fn on_progress(&self, params: ProgressNotificationParam, _context: NotificationContext<RoleServer>) {
-        if let Err(error) = self.remote.notify_progress(params).await {
+        if let Err(error) = self.pick().notify_progress(params).await {
             tracing::warn!(%error, "failed to forward caller progress notification to remote");
         }
     }

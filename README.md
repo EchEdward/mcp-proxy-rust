@@ -61,15 +61,20 @@ Provide the URL of the remote MCP server's Streamable HTTP endpoint as the first
 
 Arguments
 
-| Name             | Required | Description                                                               | Example                                       |
-| ---------------- | -------- | ------------------------------------------------------------------------- | --------------------------------------------- |
-| `command_or_url` | Yes      | The remote MCP server endpoint to connect to                              | http://example.io/mcp                         |
-| `--headers`      | No       | Headers to send to the remote server. Can be used multiple times.         | Authorization 'Bearer my-secret-access-token' |
-| `--verify-ssl`   | No       | Control SSL verification. Omit for default, `false` to disable, or a PEM bundle path. | /etc/ssl/ca-bundle.pem              |
-| `--no-verify-ssl`| No       | Disable SSL verification (alias for `--verify-ssl false`)                 |                                               |
-| `--client-id`    | No       | OAuth2 client ID for authentication                                       | your_client_id                                |
-| `--client-secret`| No       | OAuth2 client secret for authentication                                   | your_client_secret                            |
-| `--token-url`    | No       | OAuth2 token endpoint URL for authentication                              | https://auth.example.com/oauth/token          |
+| Name                     | Required | Description                                                               | Example                                       |
+| ------------------------ | -------- | ------------------------------------------------------------------------- | --------------------------------------------- |
+| `command_or_url`         | Yes      | The remote MCP server endpoint to connect to                              | http://example.io/mcp                         |
+| `--headers`              | No       | Headers to send to the remote server. Can be used multiple times.         | Authorization 'Bearer my-secret-access-token' |
+| `--transport`            | No       | The transport to use for the client. Default is `streamablehttp`.         | streamablehttp                                |
+| `--verify-ssl`           | No       | Control SSL verification. Omit for default, `false` to disable, or a PEM bundle path. | /etc/ssl/ca-bundle.pem     |
+| `--no-verify-ssl`        | No       | Disable SSL verification (alias for `--verify-ssl false`)                 |                                               |
+| `--client-id`            | No       | OAuth2 client ID for authentication                                       | your_client_id                                |
+| `--client-secret`        | No       | OAuth2 client secret for authentication                                   | your_client_secret                            |
+| `--token-url`            | No       | OAuth2 token endpoint URL for authentication                              | https://auth.example.com/oauth/token          |
+| `--upstream-pool-size`   | No       | Number of independent upstream HTTP connections for round-robin distribution. Increases request concurrency. Default is `4`. | 8 |
+| `--upstream-timeout-secs`| No       | Timeout in seconds for a single forwarded upstream request. Default is `30`. | 60                                         |
+| `--log-level`            | No       | Set the log level. Default is `INFO`.                                     | DEBUG                                         |
+| `--debug`                | No       | Enable debug mode (equivalent to `--log-level DEBUG`).                    |                                               |
 
 Environment Variables
 
@@ -133,6 +138,8 @@ Arguments
 | `--stateless`                        | No                         | Enable stateless mode for the Streamable HTTP transport. Default is False.                    |                                             |
 | `--named-server NAME COMMAND_STRING` | No                         | Defines a named stdio server.                                                                 | --named-server fetch 'uvx mcp-server-fetch' |
 | `--named-server-config FILE_PATH`    | No                         | Path to a JSON file defining named stdio servers.                                             | --named-server-config /path/to/servers.json |
+| `--log-level`                        | No                         | Set the log level. Default is `INFO`. Possible values: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. | DEBUG            |
+| `--debug`                            | No                         | Enable debug mode with detailed logging output. Equivalent to `--log-level DEBUG`.            |                                             |
 
 ### 2.2 Example usage
 
@@ -185,7 +192,7 @@ http://127.0.0.1:<port>/servers/<server-name>/mcp
 {
   "mcpServers": {
     "fetch": {
-      "disabled": false,
+      "enabled": true,
       "command": "uvx",
       "args": [
         "mcp-server-fetch"
@@ -201,6 +208,7 @@ http://127.0.0.1:<port>/servers/<server-name>/mcp
       "env": {
         "GITHUB_PERSONAL_ACCESS_TOKEN": "<YOUR_TOKEN>"
       },
+      "cwd": "/opt/my-project",
       "transportType": "stdio"
     }
   }
@@ -211,7 +219,8 @@ http://127.0.0.1:<port>/servers/<server-name>/mcp
 - `command`: (Required) The command to execute for the stdio server
 - `args`: (Optional) A list of arguments for the command. Defaults to an empty list
 - `env`: (Optional) Additional environment variables to pass to the server process
-- `disabled`: (Optional) If `true`, this server definition will be skipped. Defaults to `false`
+- `cwd`: (Optional) Working directory for the spawned server process
+- `enabled`: (Optional) If `false`, this server definition will be skipped. Defaults to `true`
 - `timeout` and `transportType`: Present in standard MCP client configs but **ignored** by `mcp-proxy`. The transport type is always stdio.
 
 ## Installation
@@ -331,6 +340,12 @@ Options:
           Allowed origins for the server. Can be used multiple times. Default is no CORS
       --expose-header <EXPOSE_HEADERS>
           Headers to expose via Access-Control-Expose-Headers. Defaults to 'mcp-session-id'
+      --upstream-pool-size <UPSTREAM_POOL_SIZE>
+          Number of independent upstream HTTP connections to open in client mode. Requests
+          are round-robin distributed across the pool. [default: 4]
+      --upstream-timeout-secs <UPSTREAM_TIMEOUT_SECS>
+          Timeout in seconds for a single forwarded upstream request in client mode.
+          [default: 30]
   -h, --help
           Print help
 

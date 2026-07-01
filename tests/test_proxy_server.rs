@@ -261,7 +261,7 @@ async fn build_proxy() -> (ForwardingProxy, Harness) {
     let remote_server = remote_server.expect("serve test remote server");
     let remote_client = remote_client.expect("connect to test remote server");
 
-    let proxy = ForwardingProxy::new(remote_client.peer().clone(), relay);
+    let proxy = ForwardingProxy::new(vec![remote_client.peer().clone()], relay, std::time::Duration::from_secs(30));
     (proxy, Harness { remote_server, remote_client })
 }
 
@@ -276,7 +276,7 @@ async fn build_full_proxy() -> (ForwardingProxy, FullHarness) {
     let remote_server = remote_server.expect("serve full remote server");
     let remote_client = remote_client.expect("connect to full remote server");
 
-    let proxy = ForwardingProxy::new(remote_client.peer().clone(), relay);
+    let proxy = ForwardingProxy::new(vec![remote_client.peer().clone()], relay, std::time::Duration::from_secs(30));
     (proxy, FullHarness { remote_server, remote_client })
 }
 
